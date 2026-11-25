@@ -1,0 +1,326 @@
+import { describe, it, expect, beforeAll, afterAll } from 'bun:test';
+import { spawn, type ChildProcess } from 'node:child_process';
+import path from 'node:path';
+
+const BINARY_PATH = path.resolve(__dirname, '../dist/amp-acp-test');
+
+interface JsonRpcMessage {
+  jsonrpc: string;
+  id?: number;
+  method?: string;
+  params?: unknown;
+  result?: Record<string, unknown>;
+  error?: { code: number; message: string };
+}
+
+let proc: ChildProcess;
+let messageQueue: JsonRpcMessage[] = [];
+let nextId = 1;
+let buffer = '';
+
+function sendMessage(msg: JsonRpcMessage): void {
+  proc.stdin!.write(JSON.stringify(msg) + '\n');
+}
+
+function sendRequest(method: string, params: unknown = {}): number {
+  const id = nextId++;
+  sendMessage({ jsonrpc: '2.0', id, method, params });
+  return id;
+}
+
+function waitFor(
+  predicate: (msg: JsonRpcMessage) => boolean,
+  timeoutMs = 2000,
+): Promise<JsonRpcMessage> {
+  return new Promise((resolve, reject) => {
+    const deadline = Date.now() + timeoutMs;
+
+    const check = () => {
+      const idx = messageQueue.findIndex(predicate);
+      if (idx !== -1) {
+        const [msg] = messageQueue.splice(idx, 1);
+        resolve(msg);
+        return;
+      }
+      if (Date.now() > deadline) {
+        reject(new Error(`waitFor timed out after ${timeoutMs}ms`));
+        return;
+      }
+      setTimeout(check, 10);
+    };
+    check();
+  });
+}
+
+function sendAndWait(
+  method: string,
+  params: unknown = {},
+  timeoutMs = 2000,
+): Promise<JsonRpcMessage> {
+  const id = sendRequest(method, params);
+  return waitFor((msg) => msg.id === id, timeoutMs);
+}
+
+describe('Binary integration tests', () => {
+  beforeAll(() => {
+    // Scrub ambient Amp credentials: these protocol tests exercise the
+    // unauthenticated paths, so the binary must not inherit a developer's or
+    // an orb's AMP_API_KEY.
+    const childEnv = { ...process.env };
+    delete childEnv.AMP_API_KEY;
+    proc = spawn(BINARY_PATH, [], {
+      stdio: ['pipe', 'pipe', 'ignore'],
+      env: childEnv,
+    });
+
+    proc.stdout!.on('data', (chunk: Buffer) => {
+      buffer += chunk.toString();
+      const lines = buffer.split('\n');
+      buffer = lines.pop()!;
+      for (const line of lines) {
+        if (line.trim()) {
+          try {
+            messageQueue.push(JSON.parse(line));
+          } catch {}
+        }
+      }
+    });
+  });
+
+  afterAll(() => {
+    if (proc) {
+      proc.kill();
+    }
+  });
+
+  it.each([{}, { auth: { terminal: false } }, { terminal: true }])(
+    'initialize returns correct capabilities and legacy auth for client capabilities %j',
+    async (clientCapabilities) => {
+      const resp = await sendAndWait('initialize', {
+        protocolVersion: 1,
+        clientCapabilities,
+      });
+
+      expect(resp.result).toBeDefined();
+      expect(resp.result!.protocolVersion).toBe(1);
+      const agentInfo = resp.result!.agentInfo as Record<string, unknown>;
+      expect(agentInfo).toBeDefined();
+      expect(agentInfo.name).toBe('amp-acp');
+      expect(agentInfo.version).toBeDefined();
+      const caps = resp.result!.agentCapabilities as Record<string, Record<string, boolean>>;
+      expect(caps.promptCapabilities.image).toBe(true);
+      expect(caps.promptCapabilities.embeddedContext).toBe(true);
+      expect(caps.mcpCapabilities.http).toBe(true);
+      expect(caps.mcpCapabilities.sse).toBe(true);
+      expect(caps._meta).toMatchObject({
+        'amp-acp/thread-lifecycle': { version: 1 },
+        'amp-acp/steering': { version: 1 },
+      });
+      const authMethods = resp.result!.authMethods as Array<{
+        id: string;
+        type?: string;
+        name: string;
+        _meta?: { 'terminal-auth'?: { command?: string; args?: string[]; label?: string } };
+      }>;
+      expect(authMethods).toHaveLength(1);
+      expect(authMethods[0].id).toBe('setup');
+      expect(authMethods[0].type).toBeUndefined();
+      expect(authMethods[0].name).toBe('Amp API Key Setup');
+      const command = authMethods[0]._meta?.['terminal-auth']?.command;
+      const label = authMethods[0]._meta?.['terminal-auth']?.label;
+      expect(command).toBeDefined();
+      expect(path.isAbsolute(command!)).toBe(true);
+      expect(command!.startsWith('/$bunfs/')).toBe(false);
+      expect(authMethods[0]._meta?.['terminal-auth']?.args).toEqual(['--setup']);
+      expect(label).toBe('Amp API Key Setup');
+    },
+  );
+
+  it('initialize advertises terminal auth when the client supports it', async () => {
+    const resp = await sendAndWait('initialize', {
+      protocolVersion: 1,
+      clientCapabilities: { auth: { terminal: true } },
+    });
+
+    expect(resp.result).toBeDefined();
+    expect(resp.result!.authMethods).toEqual([{
+      id: 'setup',
+      type: 'terminal',
+      name: 'Amp API Key Setup',
+      description: 'Run interactive setup to configure your Amp API key',
+      args: ['--setup'],
+    }]);
+  });
+
+  it('session/new returns sessionId and config options', async () => {
+    const resp = await sendAndWait('session/new', {
+      cwd: '/tmp/test',
+      mcpServers: [],
+    });
+
+    expect(resp.result).toBeDefined();
+    expect(resp.result!.sessionId).toBeDefined();
+    expect(typeof resp.result!.sessionId).toBe('string');
+    expect((resp.result!.sessionId as string).startsWith('S-')).toBe(true);
+    expect(resp.result!.modes).toBeUndefined();
+    expect(resp.result!.models).toBeUndefined();
+    const configOptions = resp.result!.configOptions as Array<{ id: string; category?: string; currentValue?: string; options?: Array<{ value: string }> }>;
+    expect(configOptions.map((option) => option.id)).toEqual([
+      'execution-environment',
+      'permission',
+      'amp-mode',
+      'reasoning-effort',
+    ]);
+    expect(configOptions.map((option) => option.category)).toEqual([
+      'mode',
+      'mode',
+      'model',
+      'thought_level',
+    ]);
+    const executor = configOptions.find((option) => option.id === 'execution-environment')!;
+    expect(executor.currentValue).toBe('local');
+    expect(executor.options?.map((option) => option.value)).toEqual(['local', 'orb']);
+    const mode = configOptions.find((option) => option.id === 'amp-mode')!;
+    expect(mode.currentValue).toBe('medium');
+    const effort = configOptions.find((option) => option.id === 'reasoning-effort')!;
+    expect(effort.currentValue).toBe('auto');
+    expect(effort.options?.map((option) => option.value)).toEqual([
+      'auto',
+      'none',
+      'minimal',
+      'low',
+      'medium',
+      'high',
+      'xhigh',
+      'max',
+    ]);
+    // Built-in modes always come first; agent modes registered by plugins
+    // installed on the machine running the test are appended after them.
+    const values = mode.options?.map((option) => option.value) ?? [];
+    expect(values.slice(0, 4)).toEqual(['low', 'medium', 'high', 'ultra']);
+  });
+
+  it('session/set_config_option updates Amp mode', async () => {
+    const sessionResp = await sendAndWait('session/new', {
+      cwd: '/tmp/test',
+      mcpServers: [],
+    });
+    const sessionId = sessionResp.result!.sessionId as string;
+
+    const resp = await sendAndWait('session/set_config_option', {
+      sessionId,
+      configId: 'amp-mode',
+      value: 'low',
+    });
+
+    expect(resp.result).toBeDefined();
+    const configOptions = resp.result!.configOptions as Array<{ id: string; currentValue?: string; options?: Array<{ value: string }> }>;
+    const mode = configOptions.find((option) => option.id === 'amp-mode')!;
+    expect(mode.currentValue).toBe('low');
+    const values = mode.options?.map((option) => option.value) ?? [];
+    expect(values.slice(0, 4)).toEqual(['low', 'medium', 'high', 'ultra']);
+  });
+
+  it('session/set_config_option updates reasoning effort', async () => {
+    const sessionResp = await sendAndWait('session/new', {
+      cwd: '/tmp/test',
+      mcpServers: [],
+    });
+    const sessionId = sessionResp.result!.sessionId as string;
+
+    const resp = await sendAndWait('session/set_config_option', {
+      sessionId,
+      configId: 'reasoning-effort',
+      value: 'xhigh',
+    });
+
+    expect(resp.result).toBeDefined();
+    const configOptions = resp.result!.configOptions as Array<{ id: string; currentValue?: string }>;
+    const effort = configOptions.find((option) => option.id === 'reasoning-effort')!;
+    expect(effort.currentValue).toBe('xhigh');
+  });
+
+  it('session/new with MCP servers returns valid sessionId', async () => {
+    const resp = await sendAndWait('session/new', {
+      cwd: '/tmp/test',
+      mcpServers: [
+        {
+          type: 'http',
+          name: 'exa',
+          url: 'https://mcp.exa.ai/mcp',
+          headers: [],
+        },
+        {
+          name: 'local-server',
+          command: 'npx',
+          args: ['mcp-server'],
+          env: [],
+        },
+      ],
+    });
+
+    expect(resp.result).toBeDefined();
+    expect((resp.result!.sessionId as string).startsWith('S-')).toBe(true);
+  });
+
+  it('session/set_mode returns empty object', async () => {
+    const sessionResp = await sendAndWait('session/new', {
+      cwd: '/tmp/test',
+      mcpServers: [],
+    });
+    const sessionId = sessionResp.result!.sessionId as string;
+
+    const resp = await sendAndWait('session/set_mode', {
+      sessionId,
+      modeId: 'bypass',
+    });
+
+    expect(resp.result).toEqual({});
+  });
+
+  it('authenticate returns error with code -32000', async () => {
+    const resp = await sendAndWait('authenticate', {
+      methodId: 'oauth',
+    });
+
+    expect(resp.error).toBeDefined();
+    expect(resp.error!.code).toBe(-32000);
+    expect(resp.error!.message).toBe('Authentication required');
+  });
+
+  it('multiple sessions are independent', async () => {
+    const resp1 = await sendAndWait('session/new', {
+      cwd: '/tmp/a',
+      mcpServers: [],
+    });
+    const resp2 = await sendAndWait('session/new', {
+      cwd: '/tmp/b',
+      mcpServers: [],
+    });
+
+    const id1 = resp1.result!.sessionId as string;
+    const id2 = resp2.result!.sessionId as string;
+    expect(id1).not.toBe(id2);
+    expect(id1.startsWith('S-')).toBe(true);
+    expect(id2.startsWith('S-')).toBe(true);
+  });
+
+  it('receives available_commands_update notification after session/new', async () => {
+    const sessionResp = await sendAndWait('session/new', {
+      cwd: '/tmp/notify-test',
+      mcpServers: [],
+    });
+    const sessionId = sessionResp.result!.sessionId as string;
+
+    const notification = await waitFor((msg) => {
+      if (msg.method !== 'session/update' || !msg.params) return false;
+      const params = msg.params as Record<string, unknown>;
+      if (params.sessionId !== sessionId) return false;
+      const update = params.update as Record<string, unknown> | undefined;
+      return update?.sessionUpdate === 'available_commands_update';
+    }, 2000);
+
+    expect(notification).toBeDefined();
+    expect(notification.method).toBe('session/update');
+  });
+});

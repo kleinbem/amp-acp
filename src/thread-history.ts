@@ -1,0 +1,156 @@
+import { spawn } from 'node:child_process';
+import type { SessionNotification } from '@agentclientprotocol/sdk';
+import { createAcpConversionState, toAcpNotifications, type AcpConversionState } from './to-acp.js';
+
+export interface ExportedThreadMessage {
+  role: string;
+  content?: unknown;
+  messageId?: unknown;
+  protocolMessageID?: unknown;
+}
+
+export interface ExportedThread {
+  messages: ExportedThreadMessage[];
+  title?: string;
+  updatedAt?: string;
+}
+
+export type ThreadHistoryExporter = (
+  threadId: string,
+  cwd: string,
+) => Promise<ExportedThreadMessage[] | ExportedThread>;
+
+function normalizeExport(value: ExportedThreadMessage[] | ExportedThread): ExportedThread {
+  if (Array.isArray(value)) return { messages: value };
+  return {
+    messages: Array.isArray(value.messages) ? value.messages : [],
+    ...(typeof value.title === 'string' ? { title: value.title } : {}),
+    ...(typeof value.updatedAt === 'string' ? { updatedAt: value.updatedAt } : {}),
+  };
+}
+
+/**
+ * Read a thread's full message history via `amp threads export <id>`.
+ */
+export const exportThreadHistory: ThreadHistoryExporter = (threadId, cwd) => {
+  const command = process.env.AMP_CLI_PATH ?? 'amp';
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, ['threads', 'export', threadId], {
+      cwd,
+      env: process.env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    child.stdout.on('data', (chunk: Buffer) => stdout.push(chunk));
+    child.stderr.on('data', (chunk: Buffer) => stderr.push(chunk));
+    child.once('error', reject);
+    child.once('close', (code) => {
+      if (code !== 0) {
+        const details = Buffer.concat(stderr).toString().trim();
+        reject(new Error(`amp threads export exited with code ${code}${details ? `: ${details}` : ''}`));
+        return;
+      }
+      try {
+        const thread = JSON.parse(Buffer.concat(stdout).toString()) as {
+          messages?: ExportedThreadMessage[];
+          title?: unknown;
+          updatedAt?: unknown;
+        };
+        resolve({
+          messages: Array.isArray(thread.messages) ? thread.messages : [],
+          ...(typeof thread.title === 'string' ? { title: thread.title } : {}),
+          ...(typeof thread.updatedAt === 'string' ? { updatedAt: thread.updatedAt } : {}),
+        });
+      } catch (e) {
+        reject(new Error(`failed to parse amp threads export output: ${e}`));
+      }
+    });
+  });
+};
+
+/**
+ * Export a thread's messages, retrying briefly when the export comes back
+ * empty. Fresh threads can take a few seconds to become visible to
+ * `amp threads export`, so an immediate replay after an adapter restart
+ * would otherwise come back empty even though the thread is intact.
+ */
+export async function exportThreadDetails(
+  exportThread: ThreadHistoryExporter,
+  threadId: string,
+  cwd: string,
+  attempts = 5,
+  delayMs = 2000,
+): Promise<ExportedThread> {
+  let latest: ExportedThread = { messages: [] };
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    latest = normalizeExport(await exportThread(threadId, cwd));
+    if (latest.messages.length > 0) return latest;
+    if (attempt < attempts - 1) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+  return latest;
+}
+
+export async function exportThreadMessages(
+  exportThread: ThreadHistoryExporter,
+  threadId: string,
+  cwd: string,
+  attempts = 5,
+  delayMs = 2000,
+): Promise<ExportedThreadMessage[]> {
+  const thread = await exportThreadDetails(exportThread, threadId, cwd, attempts, delayMs);
+  return thread.messages;
+}
+
+/**
+ * Convert exported thread messages into ACP session/update notifications.
+ * Native exported tool results differ from the stream-JSON content shape, and
+ * export IDs use protocolMessageID or legacy messageId rather than stream id.
+ */
+export function historyToNotifications(
+  messages: ExportedThreadMessage[],
+  sessionId: string,
+  state: AcpConversionState = createAcpConversionState(),
+): SessionNotification[] {
+  const notifications: SessionNotification[] = [];
+  for (const message of messages) {
+    if (message.role !== 'user' && message.role !== 'assistant') continue;
+    const nativeId = typeof message.protocolMessageID === 'string' ? message.protocolMessageID.trim() : '';
+    const legacyId = typeof message.messageId === 'string'
+      ? message.messageId.trim()
+      : typeof message.messageId === 'number' && Number.isInteger(message.messageId) && message.messageId >= 0
+        ? String(message.messageId)
+        : '';
+    const id = nativeId || legacyId || undefined;
+    const content = Array.isArray(message.content)
+      ? message.content.flatMap((block: unknown) => {
+        if (
+          !block || typeof block !== 'object' ||
+          !('type' in block) || block.type !== 'tool_result' || !('toolUseID' in block)
+        ) return [block];
+        if (typeof block.toolUseID !== 'string' || !block.toolUseID || !('run' in block)) return [];
+        const run = block.run;
+        if (
+          !run || typeof run !== 'object' ||
+          !('status' in run) || run.status !== 'done' || !('result' in run)
+        ) return [];
+        return [{
+          type: 'tool_result',
+          tool_use_id: block.toolUseID,
+          content: typeof run.result === 'string' ? run.result : JSON.stringify(run.result) ?? '',
+          is_error: false,
+        }];
+      })
+      : message.content;
+    notifications.push(
+      ...toAcpNotifications(
+        { type: message.role, message: { id, content } },
+        sessionId,
+        state,
+      ),
+    );
+  }
+  return notifications;
+}
