@@ -1,0 +1,51 @@
+# AGENTS.md
+
+## Commands
+- `bun run build` — Bundle TypeScript to `dist/index.js` (single file, Bun target)
+- `bun start` or `bun dist/index.js` — Run the ACP adapter
+- `bun run lint` — Type-check with `tsc --noEmit`
+- `bun test src/` — Run tests with Bun's built-in test runner
+- `bun run test:e2e:live` — Full-stack opt-in verification (binary + fake-CLI e2e + real Amp CLI + orb execution); needs an authenticated Amp CLI, consumes real Amp usage
+
+## Architecture
+This is an ACP (Agent Client Protocol) adapter that bridges Amp Code to ACP-compatible clients like Zed.
+
+- `src/index.ts` — Entry point, redirects console to stderr (stdout reserved for ACP stream)
+- `src/run-acp.ts` — Sets up the SDK 2 ACP v1 connection using stdin/stdout JSON streams
+- `src/agent-app.ts` — Builds the SDK 2 agent app, registers the v1 agent methods, and falls through to the extension-method handler
+- `src/acp-client.ts` — Minimal client interface used by `AmpAcpAgent` and its tests; sends `session/update` notifications and custom client-bound notifications
+- `src/acp-v2.ts` — Experimental opt-in ACP v2 bridge (`AMP_ACP_PROTOCOL=v2`); translates v2 requests and updates around the existing v1 `AmpAcpAgent`. v1 remains the default
+- `src/server.ts` — `AmpAcpAgent` class: handles session creation, listing, deletion, and closure; serializes prompts per session with a bounded queue, next-turn steering, and cancel semantics; advertises Amp slash commands; manages MCP config; and calls `@ampcode/sdk` (formerly `@sourcegraph/amp-sdk`)
+- `src/amp-transport.ts` — Executes Amp through the CLI or SDK and manages native thread archival; image turns use CLI JSON input locally or uploaded `--attach` files for Orbs (including SDK transport fallback)
+- `src/thread-mapping-store.ts` — Persists durable ACP-session-to-Amp-thread mappings, session settings, title, and last-updated timestamp; lists and deletes records for session lifecycle operations
+- `src/thread-history.ts` — Exports Amp thread messages, title, and timestamp for `session/load` replay and metadata recovery
+- `src/to-acp.ts` — Converts Amp stream events to ACP `sessionUpdate` notifications, including tool call names, raw output, file diffs, message IDs, and Amp todo calls as `plan` updates
+- `src/mcp-config.ts` — Converts ACP MCP server configs to Amp SDK format
+- `src/plugin-modes.ts` — Discovers agent modes from Amp plugins (`// @amp-agent-mode` comments in project/system plugin files, plus `amp plugins list` for Personal/Workspace plugins, cached 60s per cwd). Unknown but non-empty mode values pass through to Amp unchanged
+- `src/turn-usage.ts` — Aggregates a turn's token usage from Amp stream messages (last report wins per response id) for `PromptResponse.usage`, and exposes the latest model call's context total for `usage_update`
+- `src/turn-events.ts` — Parses Amp MCP and permission-denial status from the stream and maps Amp stop reasons to ACP stop reasons
+- `src/utils.ts` — Node-to-Web stream converters
+
+## Code Style
+- TypeScript with ES modules (`"type": "module"` in package.json), use `.js` extension in imports
+- Strict mode enabled; avoid `any` and type assertions unless necessary
+- Use `console.error` for logging (stdout is for ACP protocol only)
+- Error handling: throw `RequestError` from `@agentclientprotocol/sdk` for protocol errors
+- Naming: camelCase for variables/functions, PascalCase for classes/interfaces
+
+## Update Protocol
+
+Canonical documentation:
+
+- `README.md` — Installation, configuration, and user-facing capabilities
+- `AGENTS.md` — Architecture, development commands, and repository conventions
+- `docs/mcp-passthrough.md` — MCP configuration behavior and troubleshooting
+- `docs/npm-oidc-trusted-publishing.md` — npm publishing and release authentication
+
+| Change type | README | Architecture list | Specialized docs |
+|---|---:|---:|---:|
+| User-facing capability | Yes | Maybe | Maybe |
+| Architecture or state change | Yes | Yes | Maybe |
+| MCP behavior | Yes | Maybe | `docs/mcp-passthrough.md` |
+| Release or publishing | Maybe | No | `docs/npm-oidc-trusted-publishing.md` |
+| Rename or removal | Yes | Yes | Affected docs |

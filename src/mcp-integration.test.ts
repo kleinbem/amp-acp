@@ -1,0 +1,122 @@
+import type { AcpClient } from './acp-client.js';
+import { describe, it, beforeEach, expect } from 'bun:test';
+import { AmpAcpAgent } from './server.js';
+
+const mockClient = {
+  sessionUpdate: async () => {},
+  readTextFile: async () => ({ text: '' }),
+  writeTextFile: async () => ({}),
+  requestPermission: async () => ({ optionId: '' }),
+  createTerminal: async () => ({ id: '' }),
+  extMethod: async () => ({}),
+  extNotification: async () => {},
+} as unknown as AcpClient;
+
+describe('AmpAcpAgent MCP Integration', () => {
+  let agent: AmpAcpAgent;
+
+  beforeEach(async () => {
+    // Isolate from plugin modes installed on the developer machine.
+    agent = new AmpAcpAgent(mockClient, undefined, { discoverPluginModes: () => [] });
+    await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+  });
+
+  it('should pass through HTTP MCP server (Exa example)', async () => {
+    const session = await agent.newSession({
+      cwd: '/tmp',
+      mcpServers: [
+        {
+          type: 'http',
+          name: 'exa',
+          url: 'https://mcp.exa.ai/mcp',
+          headers: [],
+        },
+      ],
+    });
+
+    const storedSession = agent.sessions.get(session.sessionId);
+
+    expect(storedSession?.mcpConfig).toEqual({
+      exa: {
+        url: 'https://mcp.exa.ai/mcp',
+        headers: undefined,
+      },
+    });
+  });
+
+  it('should pass through mixed local and remote MCP servers', async () => {
+    const session = await agent.newSession({
+      cwd: '/tmp',
+      mcpServers: [
+        {
+          name: 'playwright',
+          command: 'npx',
+          args: ['-y', '@playwright/mcp@latest', '--headless'],
+          env: [],
+        },
+        {
+          type: 'http',
+          name: 'exa',
+          url: 'https://mcp.exa.ai/mcp?tools=web_search_exa',
+          headers: [],
+        },
+        {
+          type: 'http',
+          name: 'sourcegraph',
+          url: 'https://sourcegraph.example.com/.api/mcp/v1',
+          headers: [{ name: 'Authorization', value: 'token sgp_xxx' }],
+        },
+        {
+          type: 'sse',
+          name: 'monday',
+          url: 'https://mcp.monday.com/sse',
+          headers: [{ name: 'Authorization', value: 'Bearer monday_token' }],
+        },
+      ],
+    });
+
+    const storedSession = agent.sessions.get(session.sessionId);
+    const mcpConfig = storedSession!.mcpConfig;
+
+    expect(mcpConfig.playwright?.command).toBe('npx');
+    expect(mcpConfig.playwright?.args).toEqual(['-y', '@playwright/mcp@latest', '--headless']);
+    expect(mcpConfig.exa?.url).toBe('https://mcp.exa.ai/mcp?tools=web_search_exa');
+    expect(mcpConfig.sourcegraph?.url).toBe('https://sourcegraph.example.com/.api/mcp/v1');
+    expect(mcpConfig.monday?.url).toBe('https://mcp.monday.com/sse');
+  });
+
+  it('should correctly convert headers from array to object format', async () => {
+    const session = await agent.newSession({
+      cwd: '/tmp',
+      mcpServers: [
+        {
+          type: 'http',
+          name: 'api',
+          url: 'https://api.example.com/mcp',
+          headers: [
+            { name: 'Authorization', value: 'Bearer token123' },
+            { name: 'X-Custom-Header', value: 'custom-value' },
+          ],
+        },
+      ],
+    });
+
+    const storedSession = agent.sessions.get(session.sessionId);
+
+    expect(storedSession?.mcpConfig.api?.headers).toEqual({
+      Authorization: 'Bearer token123',
+      'X-Custom-Header': 'custom-value',
+    });
+  });
+
+  it('should handle session without MCP servers', async () => {
+    const session = await agent.newSession({
+      cwd: '/tmp',
+      mcpServers: [],
+    });
+
+    const storedSession = agent.sessions.get(session.sessionId);
+
+    expect(storedSession?.mcpConfig).toEqual({});
+  });
+});

@@ -1,0 +1,107 @@
+# Changelog
+
+## Unreleased
+
+### Changed
+
+- Update `@agentclientprotocol/sdk` from 1.9.0 to 2.1.0 and migrate to its app APIs: the v1 adapter now registers typed handlers on `agent()`, sends `session/update` as notifications, initializes the connection explicitly, and keeps custom extension methods on a raw request fallback. ACP v1 remains the default for Zed, Lody, and T3 Code; the experimental v2 bridge keeps its existing behavior.
+
+### Fixed
+
+- Reject embedded binary `resource` prompt blocks with an invalid-params error on ACP v1 and the experimental v2 bridge before starting a turn or invoking Amp.
+- Restore `session/list` through the experimental ACP v2 bridge, including working-directory filtering and cursor pagination, so clients can discover and import persisted sessions.
+- Keep current and saved session settings unchanged when a config option change is rejected during an active CLI prompt.
+- Reject terminal Amp execution failures instead of returning a successful turn, without treating provider error text containing "aborted" as user cancellation.
+- Stop advertising unregistered v1 lifecycle and steering extensions through the experimental ACP v2 bridge.
+- Preserve native message IDs during session history replay instead of losing message boundaries.
+- Replay completed native exported tool results with their tool IDs and output instead of emitting invalid ACP updates.
+
+## 0.12.0 - 2026-11-01
+
+### Added
+
+- Add an opt-in experimental ACP v2 adapter (`AMP_ACP_PROTOCOL=v2`) that returns `messageId` from `session/prompt`, streams `state_update` transitions, exposes v2 config options, and translates v1 plan and tool-call updates. ACP v1 remains the default.
+
+### Changed
+
+- Update `@agentclientprotocol/sdk` from 1.7.0 to 1.9.0, the final 1.x release. ACP v1 remains the default; the experimental v2 bridge includes the SDK's latest schema and negotiation fixes.
+
+### Compatibility
+
+- ACP v1 remains the default for Zed, Lody, T3 Code, and existing clients. No client configuration changes are required.
+- ACP v2 is opt-in and experimental. The bridge returns `messageId` immediately, reports turns through `state_update`, and translates v1 plan and tool-call updates; it is not a native v2 implementation.
+- `session/list` returns an empty list through the v2 bridge, and v2 permission prompts are not translated yet.
+- SDK 2.x is not part of this release. The adapter stays on the final 1.x SDK to avoid the SDK 2 legacy connection API removal.
+
+### Verification
+
+- `bun run lint`
+- `bun run build`
+- `bun test src/` — 213 pass, 0 fail
+- `bun run test:binary` — 16 pass, 3 skipped, 0 fail
+- The compiled-binary ACP v2 e2e test covers initialize, `session/new`, immediate `messageId`, user message echo, and idle `state_update`.
+
+## 0.11.0 - 2026-11-01
+
+### Added
+
+- Add a `reasoning-effort` ACP config option for local CLI sessions with `auto`, `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`. amp-acp passes the selection to Amp as the `--features effort:<value>` thread feature and persists it across `session/load` and `session/resume`.
+- Stream Amp thinking blocks as ACP `agent_thought_chunk` updates by default. Set `AMP_ACP_DISABLE_THINKING=1` to request plain `--stream-json` output instead.
+- Serialize concurrent `session/prompt` requests per session, queue up to 32 follow-up prompts, and cancel both the active turn and queued prompts on `session/cancel`.
+- Stream ACP `usage_update` events for the latest model call's context usage. Set `AMP_ACP_CONTEXT_WINDOW_SIZE` to match the model's context window; the default is `200000`.
+- Map Amp `max_tokens` and `error_max_turns` to the corresponding ACP stop reasons instead of always returning `end_turn`.
+- Report failed, denied, or registry-blocked MCP servers and Amp permission denials as ACP `notice` updates when the client advertises `session.notices`, with an agent-message fallback otherwise.
+- Publish a `session_info_update` with a title derived from the first prompt (60 characters, whitespace collapsed) and an `updatedAt` timestamp after every turn. Persist both with the session mapping and restore them on `session/load` and `session/resume`; a title exported by Amp takes precedence during load.
+- Advertise and implement `session/list`, `session/delete`, and `session/close`. Listing includes new sessions before their first prompt, filters by `cwd`, sorts by `updatedAt`, and paginates with an opaque cursor. Close cancels active and queued work but keeps the mapping; delete also removes the local mapping and is idempotent. Neither operation deletes the underlying Amp thread.
+- Send richer tool updates: tool names, `in_progress` status, raw output, file diffs for edit and write tools, and Amp message IDs on content chunks.
+- Convert Amp todo tool calls into ACP `plan` updates with the complete todo list, status and priority mapping, duplicate suppression, and no stray todo tool result.
+- Add the `_amp/session/steer` extension for steering a running local session as the next queued turn, with `_amp/session/steer_applied` and `_amp/session/steer_failed` notifications and explicit `failed` outcomes for Orb sessions.
+- Add native cancel-then-prompt steering for local CLI sessions. With `AMP_ACP_CANCEL_MODE=steer`, the adapter keeps the Amp input stream alive and writes the first prompt after cancellation with Amp's `steer` marker instead of treating it as ordinary queued input.
+- Advertise Amp's built-in `/review`, `/ship`, `/update-base`, and `/refactor-commits` slash prompts alongside `/init`, and pass them through to the agent unchanged.
+- Preserve ACP image prompts in local and Orb sessions. Local image turns use ordered text/image blocks over `--stream-json-input`; Orb turns upload private temporary files with `--attach` and remove them after success, failure, or cancellation. Images are no longer accepted and then silently dropped.
+- Advertise a standard ACP terminal authentication method to clients that declare `clientCapabilities.auth.terminal`, while retaining the legacy terminal-auth metadata for other clients.
+
+### Changed
+
+- Local CLI sessions now keep one Amp process per ACP session and reset that process after an idle configuration change, so the next turn uses the new settings. Orb sessions continue to use the `@ampcode/sdk` transport.
+- Session mappings now retain reasoning effort, title, and `updatedAt` alongside the existing permission mode, Amp mode, execution environment, and thread ID. `session/load` and `session/resume` restore them.
+- Configuration changes made while a turn is active are rejected instead of silently applying to the wrong process.
+
+### Compatibility
+
+- ACP v1 remains the default and only protocol enabled by this release. The experimental ACP v2 bridge is not part of 0.11.0.
+- Existing ACP clients continue to work without configuration changes; all new behavior is either additive or opt-in through an environment variable.
+- Orb sessions continue to use the SDK transport and follow the mode's routing instead of the local reasoning-effort option.
+- `AMP_ACP_CANCEL_MODE=steer` is opt-in. Without it, cancellation keeps the standard ACP behavior of terminating the local Amp process.
+
+### Verification
+
+- `bun run lint`
+- `bun run build`
+- `bun test src/` — 210 pass, 0 fail
+- `bun run test:binary` — 15 pass, 3 skipped, 0 fail
+- Manual ACP smoke tests with T3 Code (Beta), Zed, and Lody against a real Amp CLI. Native steering was verified by sending a long-running prompt, cancelling it, and observing the replacement prompt reach Amp with `steer: true`.
+
+## 0.10.0 - 2026-10-09
+
+### Added
+
+- Run Amp threads in a remote Amp Orb by selecting **Orb** under **Execution Environment** in the ACP session configuration. Orb sessions always use the `@ampcode/sdk` transport; set `AMP_ACP_ORB_PROJECT` to override the project inferred from the session directory's git remote.
+- Discover agent modes registered by Amp plugins (project, system, personal, and workspace — such as `grok45`) and list them in the Amp Mode selector alongside the built-in `low`, `medium`, `high`, and `ultra` modes. The `amp plugins list` discovery cache expires after 60 seconds per working directory, so a mode plugin installed while the adapter is running shows up in new sessions without a restart.
+- Accept any non-empty Amp mode value and pass it through to Amp unchanged (`--mode <key>` or the SDK mode option); Amp is the authority on mode resolution and rejects unknown modes when the prompt runs. A session restored via `session/load` or `session/resume` keeps its persisted mode even when the mode's plugin is temporarily unloaded.
+- Resume earlier sessions across amp-acp restarts with `session/load`: the persisted mapping restores the session's permission mode, Amp mode, and execution environment, replays prior messages from `amp threads export` (best-effort), and continues the same Amp thread.
+- Persist the exact ACP `S-...` session to Amp `T-...` thread mapping so `session/resume` continues the same thread after an amp-acp restart.
+- Advertise lifecycle protocol v1 in ACP capability metadata and expose custom native-metadata and archive/unarchive methods.
+- Store mappings atomically in owner-only state storage without prompts, responses, credentials, or Amp settings.
+- Answer each `session/prompt` with the turn's token usage (`PromptResponse.usage`), counted from the `usage` Amp reports on each model response. A response streamed as several messages that share an id is counted once. ACP marks the field experimental, and clients that do not read it are unaffected.
+
+### Compatibility and migration
+
+- Existing ACP clients can ignore the extension and continue using standard session and prompt methods.
+- Sessions created before 0.10.0 do not have a durable mapping and therefore cannot use restart resume or lifecycle archival. A new session records its mapping on the first successful Amp thread initialization.
+- Missing or mismatched mappings fail safely. amp-acp never infers lifecycle ownership from the latest thread, working directory, title, timestamp, or thread listing because those signals can select another CLI, editor, or concurrent session's thread.
+
+### Verification
+
+- Add protocol, persistence, restart-resume, archive/unarchive validation, CLI argument, security, and legacy-session coverage.
+- Keep compiled-binary ACP client coverage aligned with real durable Amp thread ID syntax.
